@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""CLI 2048 Game - Feature-rich terminal implementation with undo, hints, save/load, pause, and statistics."""
+"""CLI 2048 Game - Feature-rich terminal implementation with undo, hints, save/load, pause,
+statistics, timer, difficulty levels, auto-save, adaptive AI hints, and color themes."""
 
 import argparse
 import curses
 import json
+import math
 import random
 import sys
 import time
@@ -14,11 +16,69 @@ from pathlib import Path
 MIN_WIDTH = 25
 MIN_HEIGHT = 12
 SAVE_PATH = Path.home() / ".2048_save.json"
+AUTOSAVE_PATH = Path.home() / ".2048_autosave.json"
 BEST_SCORE_PATH = Path.home() / ".2048_best_score"
 INPUT_THROTTLE_MS = 60  # milliseconds between inputs
 
+# Difficulty presets: (prob_2, prob_4) — rest spawns nothing (stays empty, no tile)
+# In "hard" mode, 4-tiles spawn more often making the game harder.
+DIFFICULTY_PRESETS = {
+    "easy":   {"p2": 0.95, "p4": 0.05},
+    "normal": {"p2": 0.90, "p4": 0.10},
+    "hard":   {"p2": 0.80, "p4": 0.20},
+}
 
-def init_colors():
+# Color themes
+THEMES = {
+    "classic": [
+        (0,    curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (2,    curses.COLOR_WHITE,  curses.COLOR_BLUE),
+        (4,    curses.COLOR_WHITE,  curses.COLOR_MAGENTA),
+        (8,    curses.COLOR_WHITE,  curses.COLOR_RED),
+        (16,   curses.COLOR_WHITE,  curses.COLOR_RED),
+        (32,   curses.COLOR_WHITE,  curses.COLOR_RED),
+        (64,   curses.COLOR_WHITE,  curses.COLOR_RED),
+        (128,  curses.COLOR_WHITE,  curses.COLOR_YELLOW),
+        (256,  curses.COLOR_WHITE,  curses.COLOR_YELLOW),
+        (512,  curses.COLOR_WHITE,  curses.COLOR_YELLOW),
+        (1024, curses.COLOR_WHITE,  curses.COLOR_CYAN),
+        (2048, curses.COLOR_WHITE,  curses.COLOR_GREEN),
+        (4096, curses.COLOR_WHITE,  curses.COLOR_BLUE),
+    ],
+    "monochrome": [
+        (0,    curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (2,    curses.COLOR_BLACK,  curses.COLOR_WHITE),
+        (4,    curses.COLOR_BLACK,  curses.COLOR_WHITE),
+        (8,    curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (16,   curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (32,   curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (64,   curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (128,  curses.COLOR_BLACK,  curses.COLOR_WHITE),
+        (256,  curses.COLOR_BLACK,  curses.COLOR_WHITE),
+        (512,  curses.COLOR_BLACK,  curses.COLOR_WHITE),
+        (1024, curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (2048, curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (4096, curses.COLOR_WHITE,  curses.COLOR_BLACK),
+    ],
+    "warm": [
+        (0,    curses.COLOR_WHITE,  curses.COLOR_BLACK),
+        (2,    curses.COLOR_WHITE,  curses.COLOR_RED),
+        (4,    curses.COLOR_WHITE,  curses.COLOR_RED),
+        (8,    curses.COLOR_WHITE,  curses.COLOR_MAGENTA),
+        (16,   curses.COLOR_WHITE,  curses.COLOR_MAGENTA),
+        (32,   curses.COLOR_WHITE,  curses.COLOR_MAGENTA),
+        (64,   curses.COLOR_WHITE,  curses.COLOR_MAGENTA),
+        (128,  curses.COLOR_WHITE,  curses.COLOR_RED),
+        (256,  curses.COLOR_WHITE,  curses.COLOR_RED),
+        (512,  curses.COLOR_WHITE,  curses.COLOR_RED),
+        (1024, curses.COLOR_WHITE,  curses.COLOR_YELLOW),
+        (2048, curses.COLOR_WHITE,  curses.COLOR_YELLOW),
+        (4096, curses.COLOR_WHITE,  curses.COLOR_YELLOW),
+    ],
+}
+
+
+def init_colors(theme_name="classic"):
     """Pre-initialize curses color pairs to avoid runtime crashes.
 
     Returns a dict mapping tile values to initialized color pair IDs.
@@ -29,21 +89,7 @@ def init_colors():
     color_map = {}
     pair_id = 1
 
-    tile_configs = [
-        (0, curses.COLOR_BLACK, curses.COLOR_BLACK),
-        (2, curses.COLOR_WHITE, curses.COLOR_BLUE),
-        (4, curses.COLOR_WHITE, curses.COLOR_MAGENTA),
-        (8, curses.COLOR_WHITE, curses.COLOR_RED),
-        (16, curses.COLOR_WHITE, curses.COLOR_RED),
-        (32, curses.COLOR_WHITE, curses.COLOR_RED),
-        (64, curses.COLOR_WHITE, curses.COLOR_RED),
-        (128, curses.COLOR_WHITE, curses.COLOR_YELLOW),
-        (256, curses.COLOR_WHITE, curses.COLOR_YELLOW),
-        (512, curses.COLOR_WHITE, curses.COLOR_YELLOW),
-        (1024, curses.COLOR_WHITE, curses.COLOR_CYAN),
-        (2048, curses.COLOR_WHITE, curses.COLOR_GREEN),
-        (4096, curses.COLOR_WHITE, curses.COLOR_BLUE),
-    ]
+    tile_configs = THEMES.get(theme_name, THEMES["classic"])
 
     for val, fg, bg in tile_configs:
         try:
@@ -61,10 +107,21 @@ def format_score(score):
     return f"{score:,}"
 
 
+def format_time(seconds):
+    """Return mm:ss or hh:mm:ss formatted time string."""
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 class Game:
     """Core 2048 game logic with state tracking for undo, save/load, and statistics."""
 
-    def __init__(self, size=4):
+    def __init__(self, size=4, difficulty="normal"):
         self.size = size
         self.grid = [[0] * size for _ in range(size)]
         self.score = 0
@@ -76,6 +133,12 @@ class Game:
         self.moves = 0
         self.paused = False
         self.flash_cell = None  # (row, col) of last merge for animation
+        self.difficulty = difficulty
+        self._diff_cfg = DIFFICULTY_PRESETS.get(difficulty, DIFFICULTY_PRESETS["normal"])
+        # Timer
+        self.start_time = time.time()
+        self.elapsed_paused = 0.0  # accumulated time while paused
+        self._pause_start = None
 
     def _load_best_score(self):
         """Load best score from local file system."""
@@ -95,6 +158,13 @@ class Game:
                 BEST_SCORE_PATH.write_text(str(self.best_score))
             except IOError:
                 pass
+
+    def get_elapsed_time(self):
+        """Return total seconds played (excluding paused time)."""
+        total = time.time() - self.start_time - self.elapsed_paused
+        if self._pause_start is not None:
+            total -= (time.time() - self._pause_start)
+        return max(0.0, total)
 
     def _push_state(self):
         """Push current game state onto the undo history stack (max 20 entries)."""
@@ -131,16 +201,33 @@ class Game:
         self.moves = 0
         self.paused = False
         self.flash_cell = None
+        self.start_time = time.time()
+        self.elapsed_paused = 0.0
+        self._pause_start = None
         self.add_random_tile()
         self.add_random_tile()
 
+    def toggle_pause(self):
+        """Toggle pause state, tracking elapsed time correctly."""
+        if self.paused:
+            # Resume
+            if self._pause_start is not None:
+                self.elapsed_paused += time.time() - self._pause_start
+                self._pause_start = None
+            self.paused = False
+        else:
+            self._pause_start = time.time()
+            self.paused = True
+
     def add_random_tile(self):
-        """Add a 2 (90%) or 4 (10%) to a random empty cell."""
+        """Add a tile to a random empty cell according to difficulty settings."""
         empty_cells = [(r, c) for r in range(self.size) for c in range(self.size) if self.grid[r][c] == 0]
         if not empty_cells:
             return
         r, c = random.choice(empty_cells)
-        self.grid[r][c] = 2 if random.random() < 0.9 else 4
+        roll = random.random()
+        p2 = self._diff_cfg["p2"]
+        self.grid[r][c] = 2 if roll < p2 else 4
 
     def _slide_row_left(self, row):
         """Compact, merge, and pad a single list representing a row."""
@@ -245,32 +332,113 @@ class Game:
         return False
 
     def get_hint(self):
-        """Return the best move direction using a simple heuristic.
+        """Return the best move direction using an improved heuristic.
 
-        Evaluates each direction by scoring empty cells and total tile value.
+        Evaluates each direction using:
+        - Empty cell bonus (mobility)
+        - Monotonicity (reward tiles ordered in one direction along rows/cols)
+        - Merge potential (reward adjacent equal tiles)
+        - Corner bonus (reward keeping highest tile in a corner)
+
+        Looks 1-ply deep (simulates the move, then evaluates resulting position).
         Returns direction string or None if no move is possible.
         """
         if self.over or self.paused:
             return None
 
         best_dir = None
-        best_score = -1
+        best_score = -float('inf')
 
         for direction in ["up", "down", "left", "right"]:
-            # Simulate move on a copy
             test_grid = deepcopy(self.grid)
             changed, pts = self._simulate_move(test_grid, direction)
             if not changed:
                 continue
 
-            empty = sum(1 for r in range(self.size) for c in range(self.size) if test_grid[r][c] == 0)
-            total = sum(test_grid[r][c] for r in range(self.size) for c in range(self.size))
-            score = empty * 100 + total + pts
+            score = self._evaluate_grid(test_grid) + pts * 0.5
             if score > best_score:
                 best_score = score
                 best_dir = direction
 
         return best_dir
+
+    def _evaluate_grid(self, grid):
+        """Heuristic evaluation of a grid state.
+
+        Combines: empty cells, monotonicity, merge potential, smoothness, corner bonus.
+        """
+        size = self.size
+        empty = 0
+        merge_score = 0.0
+        mono_score = 0.0
+        smoothness = 0.0
+        max_val = 0
+        max_pos = None
+
+        for r in range(size):
+            for c in range(size):
+                v = grid[r][c]
+                if v == 0:
+                    empty += 1
+                    continue
+                if v > max_val:
+                    max_val = v
+                    max_pos = (r, c)
+                # Merge potential: adjacent equal tiles
+                if c + 1 < size and grid[r][c + 1] == v:
+                    merge_score += v
+                if r + 1 < size and grid[r + 1][c] == v:
+                    merge_score += v
+
+        # Empty cell bonus (log scale to avoid over-valuing emptiness)
+        empty_score = math.log2(empty + 1) * 2.7
+
+        # Monotonicity: check each row and column for ordered sequences
+        for r in range(size):
+            row_vals = [grid[r][c] for c in range(size) if grid[r][c] > 0]
+            mono_score += self._monotonicity_score(row_vals)
+        for c in range(size):
+            col_vals = [grid[r][c] for r in range(size) if grid[r][c] > 0]
+            mono_score += self._monotonicity_score(col_vals)
+
+        # Smoothness: penalize large differences between adjacent tiles
+        for r in range(size):
+            for c in range(size):
+                v = grid[r][c]
+                if v == 0:
+                    continue
+                if c + 1 < size and grid[r][c + 1] > 0:
+                    ratio = abs(math.log2(v) - math.log2(grid[r][c + 1]))
+                    smoothness -= ratio
+                if r + 1 < size and grid[r + 1][c] > 0:
+                    ratio = abs(math.log2(v) - math.log2(grid[r + 1][c]))
+                    smoothness -= ratio
+
+        # Corner bonus: reward keeping the highest tile in a corner
+        corner_bonus = 0.0
+        if max_pos is not None:
+            corners = [(0, 0), (0, size - 1), (size - 1, 0), (size - 1, size - 1)]
+            if max_pos in corners:
+                corner_bonus = math.log2(max_val) * 1.5
+
+        return empty_score + merge_score * 1.0 + mono_score * 1.0 + smoothness * 0.1 + corner_bonus
+
+    @staticmethod
+    def _monotonicity_score(vals):
+        """Score how monotonic a sequence is (higher = more ordered)."""
+        if len(vals) < 2:
+            return 0.0
+        inc = 0.0
+        dec = 0.0
+        for i in range(len(vals) - 1):
+            a = math.log2(vals[i]) if vals[i] > 0 else 0
+            b = math.log2(vals[i + 1]) if vals[i + 1] > 0 else 0
+            if a <= b:
+                inc += (b - a)
+            else:
+                dec += (a - b)
+        # Reward the dominant direction
+        return max(inc, dec) - min(inc, dec) * 0.5
 
     def _simulate_move(self, grid, direction):
         """Simulate a move on the given grid without modifying game state. Returns (changed, points)."""
@@ -304,8 +472,9 @@ class Game:
 
         return grid != old_grid, total_points
 
-    def save_game(self):
+    def save_game(self, path=None):
         """Save current game state to disk. Returns True if successful."""
+        save_path = path or SAVE_PATH
         state = {
             'grid': self.grid,
             'score': self.score,
@@ -315,19 +484,22 @@ class Game:
             'continue_after_win': self.continue_after_win,
             'moves': self.moves,
             'size': self.size,
+            'difficulty': self.difficulty,
+            'elapsed': self.get_elapsed_time(),
         }
         try:
-            SAVE_PATH.write_text(json.dumps(state, indent=2))
+            save_path.write_text(json.dumps(state, indent=2))
             return True
         except IOError:
             return False
 
-    def load_game(self):
+    def load_game(self, path=None):
         """Load game state from disk. Returns True if successful."""
-        if not SAVE_PATH.exists():
+        load_path = path or SAVE_PATH
+        if not load_path.exists():
             return False
         try:
-            data = json.loads(SAVE_PATH.read_text())
+            data = json.loads(load_path.read_text())
             self.size = data.get('size', 4)
             self.grid = data['grid']
             self.score = data['score']
@@ -336,12 +508,40 @@ class Game:
             self.over = data.get('over', False)
             self.continue_after_win = data.get('continue_after_win', False)
             self.moves = data.get('moves', 0)
+            self.difficulty = data.get('difficulty', 'normal')
+            self._diff_cfg = DIFFICULTY_PRESETS.get(self.difficulty, DIFFICULTY_PRESETS["normal"])
             self.undo_stack.clear()
             self.paused = False
             self.flash_cell = None
+            # Restore timer
+            elapsed = data.get('elapsed', 0.0)
+            self.start_time = time.time() - elapsed
+            self.elapsed_paused = 0.0
+            self._pause_start = None
             return True
         except (IOError, json.JSONDecodeError, KeyError):
             return False
+
+    def autosave(self):
+        """Auto-save current state for recovery."""
+        return self.save_game(path=AUTOSAVE_PATH)
+
+    def load_autosave(self):
+        """Load autosave if available. Returns True if loaded."""
+        if self.load_game(path=AUTOSAVE_PATH):
+            try:
+                AUTOSAVE_PATH.unlink(missing_ok=True)
+            except (IOError, TypeError):
+                try:
+                    AUTOSAVE_PATH.unlink()
+                except IOError:
+                    pass
+            return True
+        return False
+
+    def has_autosave(self):
+        """Check if an autosave file exists."""
+        return AUTOSAVE_PATH.exists()
 
     def get_stats(self):
         """Return a dict of game statistics."""
@@ -361,6 +561,8 @@ class Game:
             'avg': avg_tile,
             'tiles': len(tiles),
             'moves': self.moves,
+            'elapsed': self.get_elapsed_time(),
+            'difficulty': self.difficulty,
         }
 
     def get_grid(self):
@@ -394,6 +596,17 @@ ARROW_MAP = {
 }
 
 
+def _tile_attr(val, color_map):
+    """Return curses attribute for a tile value — bold for high values."""
+    pair_id = color_map.get(val, 1)
+    attr = curses.color_pair(pair_id)
+    if val >= 128:
+        attr |= curses.A_BOLD
+    if val >= 1024:
+        attr |= curses.A_BOLD | curses.A_STANDOUT
+    return attr
+
+
 def draw_board(stdscr, game, color_map, status_msg="", hint_dir=None):
     """Render the game board with dynamic layout and graceful resize handling."""
     stdscr.erase()
@@ -423,22 +636,25 @@ def draw_board(stdscr, game, color_map, status_msg="", hint_dir=None):
 
     # Title
     title = "CLI 2048"
+    diff_tag = f" [{game.difficulty.upper()}]"
+    title_full = title + diff_tag
     try:
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addnstr(1, max(0, (width - len(title)) // 2), title, width - 2)
+        stdscr.addnstr(1, max(0, (width - len(title_full)) // 2), title_full, width - 2)
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
     except curses.error:
         pass
 
     # Statistics bar (line 2)
     stats = game.get_stats()
+    time_str = format_time(stats['elapsed'])
     stats_str = (
         f"Score: {format_score(stats['score']):<10} "
         f"Best: {format_score(stats['best']):<10} "
         f"Max: {stats['max']:<5} "
         f"Avg: {stats['avg']:<5} "
-        f"Tiles: {stats['tiles']}/{size*size} "
-        f"Mv: {stats['moves']}"
+        f"Mv: {stats['moves']:<5} "
+        f"T: {time_str}"
     )
     try:
         stdscr.addnstr(2, max(0, (width - len(stats_str)) // 2), stats_str, width - 2)
@@ -478,9 +694,7 @@ def draw_board(stdscr, game, color_map, status_msg="", hint_dir=None):
             val = grid[r][c]
             cell_x = grid_start_x + c * (cell_w + 2) + 1
 
-            pair_id = color_map.get(val, 1)
-            attr = curses.color_pair(pair_id) | curses.A_BOLD
-
+            attr = _tile_attr(val, color_map)
             val_str = str(val).center(cell_w) if val > 0 else " " * cell_w
             try:
                 stdscr.addnstr(row_y, cell_x, val_str, cell_w, attr)
@@ -558,20 +772,31 @@ def draw_board(stdscr, game, color_map, status_msg="", hint_dir=None):
     stdscr.refresh()
 
 
-def main(stdscr, size=4):
+def main(stdscr, size=4, difficulty="normal", theme="classic", recover=False):
     """Main game loop with input handling, throttling, and all features."""
     curses.curs_set(0)
     stdscr.nodelay(False)
     stdscr.timeout(-1)
 
     # Initialize color pairs
-    color_map = init_colors()
+    color_map = init_colors(theme)
 
     # Create game instance
-    game = Game(size=size)
-    game.new_game()
+    game = Game(size=size, difficulty=difficulty)
+
+    # Try to recover autosave if requested
+    if recover and game.has_autosave():
+        if game.load_autosave():
+            pass  # recovered
+        else:
+            game.new_game()
+    else:
+        game.new_game()
 
     status_msg = ""
+    if recover and game.has_autosave():
+        status_msg = ""  # cleared after load
+
     hint_dir = None
     last_input_time = 0
 
@@ -588,8 +813,10 @@ def main(stdscr, size=4):
             continue
         last_input_time = now
 
-        # Quit
+        # Quit — autosave before exit if game is active
         if key == ord('q') or key == ord('Q'):
+            if not game.is_over():
+                game.autosave()
             break
 
         # New game
@@ -610,7 +837,7 @@ def main(stdscr, size=4):
 
         # Pause/Resume
         elif key in (ord('p'), ord('P')):
-            game.paused = not game.paused
+            game.toggle_pause()
             status_msg = "Resumed." if not game.paused else ""
 
         # Hint (lowercase h or ?)
@@ -654,12 +881,25 @@ def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="CLI 2048 Game")
     parser.add_argument('--size', type=int, default=4, help='Board size (default: 4)')
+    parser.add_argument('--difficulty', choices=['easy', 'normal', 'hard'], default='normal',
+                        help='Game difficulty: easy/normal/hard (default: normal). '
+                             'Controls spawn probability of 2 vs 4 tiles.')
+    parser.add_argument('--theme', choices=list(THEMES.keys()), default='classic',
+                        help='Color theme: classic/monochrome/warm (default: classic)')
+    parser.add_argument('--recover', action='store_true',
+                        help='Recover from autosave if available')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     try:
-        curses.wrapper(lambda stdscr: main(stdscr, size=args.size))
+        curses.wrapper(lambda stdscr: main(
+            stdscr,
+            size=args.size,
+            difficulty=args.difficulty,
+            theme=args.theme,
+            recover=args.recover,
+        ))
     except KeyboardInterrupt:
         sys.exit(0)
