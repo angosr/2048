@@ -89,9 +89,9 @@ python3 game2048.py --recover
 The elapsed time is shown in the stats bar. The timer pauses automatically when the game is paused.
 
 ### Difficulty Levels
-- **Easy** — Higher chance of 4-tiles spawning (20%), making merges easier
+- **Easy** — Lower chance of 4-tiles (5%), favoring 2-tiles for easier merges
 - **Normal** — Standard 2048 spawn rates (10% for 4-tiles)
-- **Hard** — Lower chance of 4-tiles (5%), requiring more strategic play
+- **Hard** — Higher chance of 4-tiles (20%), requiring more strategic play
 
 ### Auto-save & Recovery
 The game automatically saves your progress when you quit. Use `--recover` on the next launch to resume where you left off. Manual save/load (`s`/`l`) is also available.
