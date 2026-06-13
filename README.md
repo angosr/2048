@@ -63,11 +63,11 @@ python3 game2048.py --recover
 
 ### Difficulty Presets
 
-| Level | 2-tile chance | 4-tile chance |
-|-------|--------------|---------------|
-| Easy  | 80%          | 20%           |
-| Normal| 90%          | 10%           |
-| Hard  | 95%          | 5%            |
+| Level  | 2-tile chance | 4-tile chance |
+|--------|--------------|---------------|
+| Easy   | 95%          | 5%            |
+| Normal | 90%          | 10%           |
+| Hard   | 80%          | 20%           |
 
 ## Controls
 
